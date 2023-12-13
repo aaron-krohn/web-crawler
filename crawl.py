@@ -10,7 +10,7 @@ import argparse
 
 from pathlib import Path
 from urllib.request import urlopen, Request
-from urllib.error import URLError
+from urllib.error import URLError, HTTPError
 from urllib.robotparser import RobotFileParser
 from urllib.parse import urlparse, urlunparse
 
@@ -21,43 +21,73 @@ from bs4 import BeautifulSoup as bs
 
 class HTTPReq:
 
-    def __init__(self):
+    def __init__(self, timeout=10, base_headers={}):
 
-        base_headers = {}
+        self.base_headers = base_headers
+        self.timeout = timeout
 
 
-    def get_req(self, url, headers={}):
+    def send_req(self, req):
 
-        headers.update(self.base_headers)
+        method = req.get_method()
 
-        req = Request(url, headers=headers)
+        logging.info('%s %s', method, req.get_full_url())
 
         try:
-            resp = urlopen(req)
-        except:
-            logging.error('Failed GET request to %s', url)
+            resp = urlopen(req, timeout=self.timeout)
+        except URLError as exc:
+            logging.error('Protocol error: %s', exc)
+            return None
+        except HTTPError as exc:
+            logging.error('Request %s', exc)
+            return exc
+        except TimeoutError as exc:
+            logging.error('Request timed out: %s', exc)
+            return None
+        except Exception as exc:
+            logging.exception('%s failed: %s', method, exc)
             return None
 
         return resp
 
 
+    def head_req(self, url, headers={}):
+
+        headers.update(self.base_headers)
+        req = Request(url, headers=headers, method='HEAD')
+
+        return self.send_req(req)
+
+
+    def get_req(self, url, headers={}):
+
+        headers.update(self.base_headers)
+        req = Request(url, headers=headers, method='GET')
+
+        return self.send_req(req)
+
+
 class CrawlSite(HTTPReq):
 
-    def __init__(self, host, user_agent='CrawlSite', obey_robots=True, files_path=None, gzip_files=False):
+    def __init__(self, host, user_agent='CrawlSite', obey_robots=True, files_path=None, gzip_files=False, markup=True, images=False, timeout=10, cache_limit=86400):
+        logging.debug('CrawlSite.__init__()')
 
-        super().__init__()
+        self.ua = user_agent
+        self.base_headers = {'User-Agent': self.ua}
+        self.timeout = timeout
+        self.cache_limit = cache_limit
+        self.next_req = time.time()
+        self.crawl_delay = 2
+
+        super().__init__(timeout=self.timeout, base_headers=self.base_headers)
 
         self.host = host
         self.url = f'https://{host}'
-        self.ua = user_agent
 
-        self.base_headers = {'User-Agent': self.ua}
-
-        self.visited = {}
-        self.in_links = []
-        self.ex_links = []
-        self.ex_hosts = []
+        self.pages = {}
         self.sitemap = []
+
+        self.markup = markup
 
         self.obey_robots = obey_robots
         self.rp = RobotFileParser()
@@ -72,7 +102,21 @@ class CrawlSite(HTTPReq):
         signal.signal(signal.SIGINT, self.clean_shutdown)
 
 
+    def wait(self):
+        """Processes take time, so figure out the time when the next request should be
+           while respecting the rate limit / crawl delay, but count process time as part
+           of the wait. In other words, process while waiting,  don't process and then
+           wait the crawl delay.
+        """
+        logging.debug('CrawlSite.wait()')
+        wait = self.next_req - time.time()
+        if wait > 0:
+            time.sleep(wait)
+        self.next_req = time.time() + self.crawl_delay
+
+
     def clean_shutdown(self, sig, frame):
+        logging.debug('CrawlSite.clean_shutdown()')
 
         logging.info('Executing clean shutdown')
         self.save_session()
@@ -82,6 +126,7 @@ class CrawlSite(HTTPReq):
 
 
     def load_robots(self, robots_file=None):
+        logging.debug('CrawlSite.load_robots()')
 
         if robots_file is None:
             robots_url = f'https://{self.host}/robots.txt'
@@ -105,7 +150,14 @@ class CrawlSite(HTTPReq):
         if lines:
             self.rp.parse(lines)
 
-        for sitemap in self.rp.site_maps():
+        sleep_for = self.rp.crawl_delay(self.ua)
+        self.crawl_delay = self.crawl_delay if sleep_for is None else sleep_for
+
+        sm = self.rp.site_maps()
+        if sm is not None:
+            self.sitemap = sm
+
+        for sitemap in self.sitemap:
             if sitemap not in self.sitemap:
                 self.sitemap.append(sitemap)
 
@@ -113,6 +165,7 @@ class CrawlSite(HTTPReq):
 
 
     def load_sitemap(self, map_url=[]):
+        logging.debug('CrawlSite.load_sitemap()')
 
         headers = {'User-Agent': self.ua}
 
@@ -125,109 +178,131 @@ class CrawlSite(HTTPReq):
             soup = bs(sitemap_raw, 'lxml')
 
             for link in soup.find_all('loc'):
-                if link.text not in self.in_links:
-                    self.in_links.append(link.text)
+                self.add_link(link.text)
+
+
+    def add_link(self, href):
+        logging.debug('CrawlSite.add_link()')
+
+        if href not in self.pages or ((time.time() - self.cache_limit) > self.pages[href].setdefault('last_visit', self.cache_limit)):
+            if href not in self.pages:
+                new_page = True
+                expired = False
+            else:
+                new_page = False
+                expired = (time.time() - self.cache_limit) > self.pages[href].setdefault('last_visit', self.cache_limit)
+            logging.debug('Adding link: New page (%s) or Expired (%s)', new_page, expired)
+
+            self.pages[href] = {
+                'last_visit': time.time() + self.cache_limit,
+                'links': {},
+                'malformed': [],
+                'status_code': None,
+                'images': [],
+                'files': [],
+                'mime_type': '',
+                'head_status': None,
+                }
+
+            self.wait()
+            head = self.head_req(href)
+
+            if head is not None:
+                mime = head.headers.get('content-type')
+                status = int(head.status)
+                self.pages[href]['mime_type'] = mime
+                self.pages[href]['head_status'] = status
 
 
     def crawl(self):
+        logging.debug('CrawlSite.crawl()')
+        logging.info('Crawling site %s with %s second delay between requests', self.host, self.crawl_delay)
 
-        # Processes take time, so figure out the time when the next request should be
-        # while respecting the rate limit / crawl delay, but count process time as part
-        # of the wait. In other words, process while waiting,  don't process and then
-        # wait the crawl delay.
-        # TODO: move this into some kind of function
-        sleep_for = self.rp.crawl_delay(self.ua)
-        sleep_for = 2 if sleep_for is None else sleep_for
-        next_req = time.time() + sleep_for
-
-        logging.info('Crawling site %s with %s second delay between requests', self.host, sleep_for)
-
-        if not self.in_links:
+        if not self.pages:
             base_url = f'https://{self.host}/'
             if not self.obey_robots or self.rp.can_fetch(self.ua, base_url):
-                self.extract_links(base_url)
+                self.add_link(base_url)
 
-            wait = next_req - time.time()
-            if wait > 0:
-                time.sleep(wait)
-
-            next_req = time.time() + sleep_for
-
-        idx = -1
-        while idx < len(self.in_links):
-
+        idx = 0
+        crawl_pages = list(self.pages.keys())
+        while idx < len(crawl_pages):
+            crawl_url = crawl_pages[idx]
             idx += 1
 
-            try:
-                crawl_url = self.in_links[idx]
-            except:
-                logging.info('Crawling complete')
-                return
+            if not crawl_url.startswith(f'https://{self.host}'):
+                logging.info('Not crawling external link: %s', crawl_url)
+                continue
+
+            if time.time() < self.pages[crawl_url]['last_visit'] and self.pages[crawl_url]['status_code'] is not None:
+                logging.debug('Skipping cached page: %s', crawl_url)
+                continue
 
             if self.obey_robots and not self.rp.can_fetch(self.ua, crawl_url):
                 logging.info('URL fetch prevented by robots.txt: %s', crawl_url)
                 continue
 
-            if self.in_links[idx] in self.visited:
-                logging.debug('Skipping visited URL: %s', self.in_links[idx])
-                continue
+            self.extract_links(crawl_url)
+            crawl_pages = list(self.pages.keys())
 
-            self.extract_links(self.in_links[idx])
-
-            wait = next_req - time.time()
-            if wait > 0:
-                time.sleep(wait)
-
-            next_req = time.time() + sleep_for
+        logging.info('Crawl complete')
 
 
     def extract_links(self, target_url):
-
+        logging.debug('CrawlSite.extract_links()')
         logging.info('Extracting links from: %s', target_url)
 
+        if 'text/html' not in self.pages[target_url]['mime_type']:
+            logging.info('Skipping invalid MIME type: %s', self.pages[target_url]['mime_type'])
+            return
+
+        if self.pages[target_url]['status_code'] is not None and self.pages[target_url]['last_visit'] > time.time():
+            logging.debug('Skipping visited page')
+            return
+
+        self.wait()
         resp = self.get_req(target_url)
         if resp is None:
             return
 
-        # Add support for text/xml
-        if 'text/html' not in resp.headers.get('content-type'):
-            logging.info('Skipping invalid MIME type: %s', resp.headers.get('content-type'))
+        self.pages[target_url]['last_visit'] = time.time() + self.cache_limit
+        self.pages[target_url]['status_code'] = int(resp.status)
+
+        if resp.status != 200:
+            logging.info('Not parsing %s status code', resp.status)
             return
 
+        # Add support for text/xml
         raw_html = resp.read()
-        filename = hashlib.file_digest(io.BytesIO(raw_html), 'sha256').hexdigest() + '.html'
-
-        if self.gzip:
-            filename += '.gz'
-        fullpath = Path(self.files, filename)
-
         logging.debug('HTML Size: %s', len(raw_html))
 
-        self.visited[target_url] = {
-                'last_visit': time.time(),
-                'links': {},
-                'file_loc': str(fullpath),
-                'malformed': [],
-                }
+        # Write HTML to file
+        if self.markup:
+            filename = hashlib.file_digest(io.BytesIO(raw_html), 'sha256').hexdigest() + '.html'
 
-        if not fullpath.is_file():
             if self.gzip:
-                with gzip.open(fullpath, 'wb') as f:
-                    f.write(raw_html)
-            else:
-                with open(fullpath, 'w') as f:
-                    f.write(raw_html.decode('utf-8'))
-        else:
-            logging.info('Not overwriting existing file: %s', fullpath)
+                filename += '.gz'
+            fullpath = Path(self.files, filename)
 
-        logging.info('Wrote HTML to %s', fullpath)
+            self.pages[target_url]['file_loc'] = str(fullpath),
+
+            if not fullpath.is_file():
+                if self.gzip:
+                    with gzip.open(fullpath, 'wb') as f:
+                        f.write(raw_html)
+                else:
+                    with open(fullpath, 'w') as f:
+                        f.write(raw_html.decode('utf-8'))
+
+                logging.info('Wrote HTML to %s', fullpath)
+            else:
+                logging.info('Not overwriting existing file: %s', fullpath)
 
         soup = bs(raw_html, 'html.parser')
 
         for link in soup.find_all('a'):
 
             href = link.get('href')
-            if href is None:
+            if not href:
                 continue
 
             # Fix salvageable links
@@ -245,7 +320,7 @@ class CrawlSite(HTTPReq):
                 href = f'https://{self.host}/{href}'
             elif href.startswith('..'):
                 # ../path/123 -> https://foo.com/path/123
-                href = f'https://{self.host}' + href[2:]
+                href = f'https://{self.host}' + href.lstrip('..')
 
             try:
                 parts = urlparse(href)
@@ -254,14 +329,16 @@ class CrawlSite(HTTPReq):
                 continue
 
             if not all([parts.scheme, parts.netloc]):
-                logging.info('Malformed HREF: %s', href)
-                self.visited[target_url]['malformed'].append(href)
+                logging.info('Malformed HREF: "%s"', href)
+                self.pages[target_url]['malformed'].append(href)
                 continue
-
-            logging.debug('HREF PARSED: %s', parts)
 
             if parts.fragment:
                 href = href.replace('#'+parts.fragment, '')
+
+            href_path = parts.path
+            if href_path.startswith('../'):
+                href_path = '/' + href_path.lstrip('../')
 
             hn = parts.hostname
 
@@ -269,36 +346,27 @@ class CrawlSite(HTTPReq):
             # We only want real pages, not search results to real pages
             clean_href = 'https://'
             clean_href += hn if hn else self.host
-            clean_href += parts.path if parts.path else '/'
+            clean_href += href_path if href_path else '/'
 
-            self.visited[target_url]['links'].setdefault(href, clean_href)
+            self.pages[target_url]['links'].setdefault(href, clean_href)
+            self.add_link(clean_href)
 
-            # The rest could all be extracted "offline" from self.visited if necessary
-            if hn and self.host not in hn:
-                if hn not in self.ex_hosts:
-                    logging.info('Found new external host: %s', hn)
-                    self.ex_hosts.append(hn)
+        for img in soup.find_all('img'):
 
-                if clean_href not in self.ex_links:
-                    logging.info('Appending external link: %s', clean_href)
-                    self.ex_links.append(clean_href)
-            else:
-                if clean_href not in self.in_links:
-                    logging.info('Appending internal link: %s', clean_href)
-                    self.in_links.append(clean_href)
+            src = img.get('src')
+            self.pages[target_url]['images'].append(src)
 
 
     def save_session(self, filename=None):
+        logging.debug('CrawlSite.save_session()')
 
         if filename is None:
             filename = self.host.replace('.', '_') + '.json'
 
         data = {
                 'host': self.host,
-                'external_hosts': self.ex_hosts,
-                'internal_links': self.in_links,
-                'external_links': self.ex_links,
-                'visited': self.visited,
+                'pages': self.pages,
+                'sitemap': self.sitemap,
                 }
 
         json_data = json.dumps(data, indent=4)
@@ -310,6 +378,7 @@ class CrawlSite(HTTPReq):
 
 
     def load_session(self, filename=None):
+        logging.debug('CrawlSite.load_session()')
 
         if filename is None:
             filename = self.host.replace('.', '_') + '.json'
@@ -331,10 +400,8 @@ class CrawlSite(HTTPReq):
 
         lookup = {
                 'host': 'host',
-                'external_hosts': 'ex_hosts',
-                'internal_links': 'in_links',
-                'external_links': 'ex_links',
-                'visited': 'visited',
+                'pages': 'pages',
+                'sitemap': 'sitemap',
                 }
 
         for key, attr in lookup.items():
@@ -346,11 +413,9 @@ class CrawlSite(HTTPReq):
                 continue
 
         logging.info(
-                'Session loaded: Host %s :: %s internal links, %s external links from %s external hosts',
+                'Session loaded: Host %s :: %s links',
                 self.host,
-                len(self.in_links),
-                len(self.ex_links),
-                len(self.ex_hosts)
+                len(self.pages)
                 )
 
 
@@ -361,6 +426,9 @@ def parse_args():
     parser.add_argument('-p', '--page', dest='page', action='store', help='Crawls given page')
     parser.add_argument('-d', '--debug', dest='debug', action='store_true', default=False, help='Show debug output')
     parser.add_argument('-z', '--gzip', dest='gzip', action='store_true', default=False, help='Store compressed HTML files')
+    parser.add_argument('-n', '--no-cache', dest='nocache', action='store_true', default=False, help='Refresh cached pages')
+    parser.add_argument('-c', '--cache-limt', dest='cachelimit', action='store', default=86400, type=int, help='Cache expiration limit')
+    parser.add_argument('-l', '--log', dest='logfile', action='store', help='File location for log file')
 
     parsed = parser.parse_args()
 
@@ -372,7 +440,14 @@ if __name__ == '__main__':
     conf = parse_args()
 
     loglevel = logging.DEBUG if conf.debug else logging.INFO
-    logging.basicConfig(level=loglevel, format='%(asctime)s [%(levelname)s] %(message)s')
+    logging.basicConfig(level=loglevel, format='%(asctime)s [%(levelname)s] %(message)s', filename=conf.logfile)
+
+    logging.debug('ARGS: %s', conf)
+
+    if conf.nocache:
+        cache = 0
+    else:
+        cache = conf.cachelimit
 
     if conf.page:
         url_parts = urlparse(conf.page)
@@ -380,14 +455,14 @@ if __name__ == '__main__':
         if not host:
             host = url.netloc
 
-        crawler = CrawlSite(host=host, gzip_files=conf.gzip)
+        crawler = CrawlSite(host=host, gzip_files=conf.gzip, cache_limit=cache)
         crawler.load_session()
         crawler.load_robots()
         crawler.extract_links(conf.page)
         crawler.save_session()
 
     if conf.site:
-        crawler = CrawlSite(host=conf.site, gzip_files=conf.gzip)
+        crawler = CrawlSite(host=conf.site, gzip_files=conf.gzip, cache_limit=cache)
         crawler.load_session()
         crawler.load_robots()
         crawler.crawl()
